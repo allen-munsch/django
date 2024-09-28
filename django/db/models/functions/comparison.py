@@ -1,7 +1,8 @@
 """Database functions that do comparisons or type conversions."""
 
+import json
 from django.db import NotSupportedError
-from django.db.models.expressions import Func, Value
+from django.db.models.expressions import Func, Value, F
 from django.db.models.fields import TextField
 from django.db.models.fields.json import JSONField
 from django.utils.regex_helper import _lazy_re_compile
@@ -198,6 +199,108 @@ class JSONObject(Func):
         return self.as_native(compiler, connection, returning="CLOB", **extra_context)
 
 
+
+class JSONSet(Func):
+    function = "JSON_SET"
+    lookup_name = "set"
+    output_field = JSONField()
+    field = None
+
+    def __init__(self, field, **updates):
+        if not updates:
+            raise ValueError("JSONSet requires at least one update.")
+        self.field = field
+        self.updates = updates
+        expressions = [Cast(F(field), TextField())]
+        for key, value in updates.items():
+            print(f'key: {key}')
+            json_path = self._build_json_path(key)
+            expressions.extend([Value(json_path), value])
+        print(expressions)
+        super().__init__(*expressions)
+
+    def _build_json_path(self, key):
+        parts = key.split('__')
+        path = '$'
+        for part in parts:
+            if part.isdigit():
+                path += f'[{part}]'
+            elif part == '#':
+                path += '[#]'
+            else:
+                path += f'."{part}"'
+        return path
+
+    def as_sqlite(self, compiler, connection, **extra_context):
+        lhs, params = compiler.compile(self.source_expressions[0])
+        for i in range(1, len(self.source_expressions), 2):
+            key, value = self.source_expressions[i:i+2]
+            key_sql, key_params = compiler.compile(key)
+            value_sql, value_params = compiler.compile(value)
+            
+            lhs = f"JSON_SET({lhs}, {key_sql}, {value_sql})"
+            params.extend(key_params)
+            params.extend(value_params)
+        
+        return lhs, params
+
+    def as_postgresql(self, compiler, connection, **extra_context):
+        lhs, params = compiler.compile(self.source_expressions[0])
+        for i in range(1, len(self.source_expressions), 2):
+            key, value = self.source_expressions[i:i+2]
+            key_sql, key_params = compiler.compile(key)
+            value_sql, value_params = compiler.compile(value)
+            print(f"value_sql: {value_sql}")
+            print(f"key_params: {key_params}")
+            path = self._build_postgres_path(key_params[0])
+            print(f"path: {path}")
+            lhs = f"jsonb_set({lhs}, {path}, to_jsonb({value_sql}), true)"
+            params.extend(value_params)
+        
+        return lhs, params
+
+    def _build_postgres_path(self, key):
+        parts = key.split('__')
+        return "'{" + ','.join(part if part.isdigit() else f'"{part}"' for part in parts) + "}'"
+
+    def as_sql(self, compiler, connection, **extra_context):
+        vendor = connection.vendor
+        if vendor == 'sqlite':
+            return self.as_sqlite(compiler, connection, **extra_context)
+        elif vendor == 'postgresql':
+            return self.as_postgresql(compiler, connection, **extra_context)
+        elif vendor in ['oracle']:
+            # Implement Oracle specific logic here if needed
+            raise NotImplementedError(f"JSONSet for {vendor} is not implemented yet.")
+        else:
+            raise NotImplementedError(f"JSONSet is not supported for {vendor}.")
+
+
+class JSONRemove(Func):
+    function = 'JSON_REMOVE'
+    lookup_name = 'remove'
+    output_field = JSONField()
+
+    def __init__(self, expression, *paths):
+        expressions = [expression] + [Value(path) for path in paths]
+        super().__init__(*expressions)
+
+    def as_sqlite(self, compiler, connection, **extra_context):
+        return self.as_sql(compiler, connection, function='JSON_REMOVE', **extra_context)
+
+    def as_postgresql(self, compiler, connection, **extra_context):
+        paths = [arg for arg in self.source_expressions[1:]]
+        path_array = "ARRAY[" + ", ".join(f"'{p}'" for p in paths) + "]::text[]"
+        template = f"jsonb_strip_nulls(%(expressions)s #- {path_array})"
+        return self.as_sql(compiler, connection, template=template, **extra_context)
+
+    def as_mysql(self, compiler, connection, **extra_context):
+        return self.as_sql(compiler, connection, function='JSON_REMOVE', **extra_context)
+
+    def as_oracle(self, compiler, connection, **extra_context):
+        return self.as_sql(compiler, connection, function='JSON_TRANSFORM', **extra_context)
+
+
 class Least(Func):
     """
     Return the minimum expression.
@@ -228,3 +331,7 @@ class NullIf(Func):
         if isinstance(expression1, Value) and expression1.value is None:
             raise ValueError("Oracle does not allow Value(None) for expression1.")
         return super().as_sql(compiler, connection, **extra_context)
+
+
+JSONField.register_lookup(JSONSet)
+JSONField.register_lookup(JSONRemove)

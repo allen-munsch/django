@@ -188,6 +188,71 @@ Usage example:
     >>> author.json_object
     {'name': 'margaret smith', 'alias': 'msmith', 'age': 50}
 
+``JSONSet``
+-----------
+
+.. class:: JSONSet(expression, **updates)
+
+Takes a JSON field or expression and returns a new JSON object with the given updates applied.
+
+Usage example:
+
+.. code-block:: pycon
+
+    >>> from django.db.models import F
+    >>> from django.db.models.functions import JSONSet
+    >>> Author.objects.create(name="John Smith", data={"age": 25, "city": "New York"})
+    >>> Author.objects.update(data=JSONSet("data", age=F("data__age") + 1, country="USA"))
+    1
+    >>> author = Author.objects.get()
+    >>> print(author.data)
+    {'age': 26, 'city': 'New York', 'country': 'USA'}
+
+``JSONSet`` supports different syntaxes for different database backends:
+
+- SQLite: Uses `JSON_SET`
+- PostgreSQL: Uses `jsonb_set`
+- MySQL/MariaDB: Uses `JSON_SET`
+- Oracle: Uses `JSON_TRANSFORM`
+
+Note: The exact behavior might vary slightly between database backends due to differences in their JSON implementations.
+
+``JSONRemove``
+--------------
+
+.. class:: JSONRemove(expression, *paths)
+
+Removes one or more paths from a JSON field or expression.
+
+Usage example:
+
+.. code-block:: pycon
+
+    >>> from django.db.models.functions import JSONRemove
+    >>> Author.objects.create(name="Jane Doe", data={"age": 30, "city": "London", "pets": ["dog", "cat"]})
+    >>> Author.objects.update(data=JSONRemove("data", "$.city", "$.pets[1]"))
+    1
+    >>> author = Author.objects.get()
+    >>> print(author.data)
+    {'age': 30, 'pets': ['dog']}
+
+``JSONRemove`` supports different syntaxes for different database backends:
+
+- SQLite: Uses `JSON_REMOVE`
+- PostgreSQL: Uses `jsonb_strip_nulls` and the `#-` operator
+- MySQL/MariaDB: Uses `JSON_REMOVE`
+- Oracle: Uses `JSON_TRANSFORM`
+
+Note: The exact behavior might vary slightly between database backends due to 
+differences in their JSON implementations.
+
+Both ``JSONSet`` and ``JSONRemove`` can be used in annotations, aggregations, 
+or as part of complex queries. They provide a way to modify JSON data directly 
+in the database, which can be more efficient than fetching the data, modifying 
+it in Python, and then saving it back to the database.
+
+
+
 ``Least``
 ---------
 
