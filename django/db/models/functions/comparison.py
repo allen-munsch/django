@@ -2,10 +2,12 @@
 
 import json
 from django.db import NotSupportedError
-from django.db.models.expressions import Func, Value, F
+from django.db.models.expressions import Func, Value, F, CombinedExpression, Expression
 from django.db.models.fields import TextField
 from django.db.models.fields.json import JSONField
 from django.utils.regex_helper import _lazy_re_compile
+
+from django.forms.fields import BooleanField, CharField, IntegerField, FloatField
 
 
 class Cast(Func):
@@ -199,27 +201,30 @@ class JSONObject(Func):
         return self.as_native(compiler, connection, returning="CLOB", **extra_context)
 
 
-
 class JSONSet(Func):
     function = "JSON_SET"
     lookup_name = "set"
     output_field = JSONField()
     field = None
+    expressions = []
 
     def __init__(self, field, **updates):
         if not updates:
             raise ValueError("JSONSet requires at least one update.")
         self.field = field
         self.updates = updates
-        expressions = [Cast(F(field), TextField())]
+        self.expressions = [F(field)]
         for key, value in updates.items():
-            print(f'key: {key}')
-            json_path = self._build_json_path(key)
-            expressions.extend([Value(json_path), value])
-        print(expressions)
-        super().__init__(*expressions)
+            self.expressions.extend([Value(key), value])
+        super().__init__(*self.expressions)
 
-    def _build_json_path(self, key):
+    def _build_postgres_path(self, key):
+        return '{' + ','.join(f'"{part}"' for part in key.split('__')) + '}'
+
+    def _build_mysql_path(self, key):
+        return '$.' + '.'.join(f'"{part}"' for part in key.split('__'))
+
+    def _build_sqlite_path(self, key):
         parts = key.split('__')
         path = '$'
         for part in parts:
@@ -236,12 +241,11 @@ class JSONSet(Func):
         for i in range(1, len(self.source_expressions), 2):
             key, value = self.source_expressions[i:i+2]
             key_sql, key_params = compiler.compile(key)
+            key_params = [self._build_sqlite_path(x) for x in key_params]
             value_sql, value_params = compiler.compile(value)
-            
             lhs = f"JSON_SET({lhs}, {key_sql}, {value_sql})"
             params.extend(key_params)
             params.extend(value_params)
-        
         return lhs, params
 
     def as_postgresql(self, compiler, connection, **extra_context):
@@ -250,56 +254,147 @@ class JSONSet(Func):
             key, value = self.source_expressions[i:i+2]
             key_sql, key_params = compiler.compile(key)
             value_sql, value_params = compiler.compile(value)
-            print(f"value_sql: {value_sql}")
-            print(f"key_params: {key_params}")
             path = self._build_postgres_path(key_params[0])
-            print(f"path: {path}")
-            lhs = f"jsonb_set({lhs}, {path}, to_jsonb({value_sql}), true)"
+            value_sql = f"to_jsonb({value_sql})"
+            lhs = f"jsonb_set(({lhs})::jsonb, '{path}'::text[], {value_sql}, true)"
             params.extend(value_params)
-        
         return lhs, params
 
-    def _build_postgres_path(self, key):
-        parts = key.split('__')
-        return "'{" + ','.join(part if part.isdigit() else f'"{part}"' for part in parts) + "}'"
+    def as_mysql(self, compiler, connection, **extra_context):
+        lhs, params = compiler.compile(self.source_expressions[0])
+        for i in range(1, len(self.source_expressions), 2):
+            key, value = self.source_expressions[i:i+2]
+            key_sql, key_params = compiler.compile(key)
+            key_params = [self._build_sqlite_path(x) for x in key_params]
+            value_sql, value_params = compiler.compile(value)
+            lhs = f"JSON_SET({lhs}, {key_sql}, {value_sql})"
+            params.extend(key_params)
+            params.extend(value_params)
+        return lhs, params
+
+    def as_sql(self, compiler, connection, **extra_context):
+        vendor = connection.vendor
+        if vendor in ['sqlite', 'mysql', 'mariadb']:
+            return self.as_sqlite(compiler, connection, **extra_context)
+        elif vendor == 'postgresql':
+            return self.as_postgresql(compiler, connection, **extra_context)
+        else:
+            raise NotImplementedError(f"JSONSet is not supported for {vendor}.")
+    def as_sql(self, compiler, connection, **extra_context):
+        vendor = connection.vendor
+        if vendor == 'sqlite':
+            return self.as_sqlite(compiler, connection, **extra_context)
+        elif vendor in ['mysql', 'maria']:
+            return self.as_mysql(compiler, connection, **extra_context)
+        elif vendor == 'postgresql':
+            return self.as_postgresql(compiler, connection, **extra_context)
+        else:
+            # Implement Oracle specific logic here if needed
+            raise NotImplementedError(f"JSONSet for {vendor} is not implemented yet.")
+
+
+class JSONExtract(Func):
+    function = 'JSON_EXTRACT'
+
+    def as_postgresql(self, compiler, connection):
+        lhs, lhs_params = compiler.compile(self.source_expressions[0])
+        paths = []
+        for expr in self.source_expressions[1:]:
+            _, path_params = compiler.compile(expr)
+            path = path_params[0].strip('"').replace('.', ',')
+            paths.append('{' + path + '}')
+        
+        if len(paths) == 1:
+            return f"({lhs} #>> %s)", lhs_params + paths
+        else:
+            path_placeholders = ['%s'] * len(paths)
+            placeholders = []
+            for placeholder in path_placeholders:
+                sub_selection = f'({lhs} #>> {placeholder})'
+                placeholders.append(sub_selection)
+            array_select = ', '.join(placeholders)
+            return f"ARRAY[{', '.join([f'({lhs} #>> {placeholder})' for placeholder in path_placeholders])}]", lhs_params + paths
+
+    def as_sqlite(self, compiler, connection, **extra_context):
+        lhs, lhs_params = compiler.compile(self.source_expressions[0])
+        paths = []
+        for expr in self.source_expressions[1:]:
+            _, path_params = compiler.compile(expr)
+            path = f'$.{path_params[0]}' if isinstance(path_params[0], str) else f'$[{path_params[0]}]'
+            paths.append(path)
+        
+        if len(paths) == 1:
+            return f"{self.function}({lhs}, %s)", lhs_params + paths
+        else:
+            path_extractions = ', '.join([f"{self.function}({lhs}, %s)" for _ in paths])
+            return f"json_array({path_extractions})", lhs_params + paths
+
+    def as_mysql(self, compiler, connection, **extra_context):
+        lhs, lhs_params = compiler.compile(self.source_expressions[0])
+        paths = []
+        for expr in self.source_expressions[1:]:
+            _, path_params = compiler.compile(expr)
+            path = f'$.{path_params[0]}' if isinstance(path_params[0], str) else f'$[{path_params[0]}]'
+            paths.append(path)
+        
+        if len(paths) == 1:
+            return f"JSON_UNQUOTE({self.function}({lhs}, %s))", lhs_params + paths
+        else:
+            path_extractions = ', '.join([f"JSON_UNQUOTE({self.function}({lhs}, %s))" for _ in paths])
+            return f"JSON_ARRAY({path_extractions})", lhs_params + paths
+
+class JSONRemove(Func):
+    function = "JSON_REMOVE"
+    output_field = JSONField()
+    lookup_name = "remove"
+    field = None
+
+    def __init__(self, field, *paths):
+        if not paths:
+            raise ValueError("JSONRemove requires at least one path to remove.")
+        self.field = field
+        self.paths = paths
+        expressions = [F(field)] + [Value(path) for path in paths]
+        super().__init__(*expressions)
+
+    def _build_sqlite_path(self, key):
+        return f'$.{key}'
+
+    def _build_postgres_path(self, path):
+        return '{' + ','.join(f'"{part}"' for part in path.split('.')) + '}'
+
+    def as_sqlite(self, compiler, connection, **extra_context):
+        lhs, params = compiler.compile(self.source_expressions[0])
+        path_params = [self._build_sqlite_path(path) for path in self.paths]
+        placeholders = ', '.join(['%s'] * len(path_params))
+        sql = f"JSON_REMOVE({lhs}, {placeholders})"
+        return sql, params + path_params
+
+    def as_postgresql(self, compiler, connection, **extra_context):
+        lhs, params = compiler.compile(self.source_expressions[0])
+        for path in self.paths:
+            postgres_path = self._build_postgres_path(path)
+            lhs = f"({lhs})::jsonb #- %s"
+            params.append(postgres_path)
+        return lhs, params
+
+    def as_mysql(self, compiler, connection, **extra_context):
+        lhs, params = compiler.compile(self.source_expressions[0])
+        path_params = [self._build_sqlite_path(path) for path in self.paths]
+        placeholders = ', '.join(['%s'] * len(path_params))
+        sql = f"JSON_REMOVE({lhs}, {placeholders})"
+        return sql, params + path_params
 
     def as_sql(self, compiler, connection, **extra_context):
         vendor = connection.vendor
         if vendor == 'sqlite':
             return self.as_sqlite(compiler, connection, **extra_context)
+        elif vendor in ['mysql', 'mariadb']:
+            return self.as_mysql(compiler, connection, **extra_context)
         elif vendor == 'postgresql':
             return self.as_postgresql(compiler, connection, **extra_context)
-        elif vendor in ['oracle']:
-            # Implement Oracle specific logic here if needed
-            raise NotImplementedError(f"JSONSet for {vendor} is not implemented yet.")
         else:
-            raise NotImplementedError(f"JSONSet is not supported for {vendor}.")
-
-
-class JSONRemove(Func):
-    function = 'JSON_REMOVE'
-    lookup_name = 'remove'
-    output_field = JSONField()
-
-    def __init__(self, expression, *paths):
-        expressions = [expression] + [Value(path) for path in paths]
-        super().__init__(*expressions)
-
-    def as_sqlite(self, compiler, connection, **extra_context):
-        return self.as_sql(compiler, connection, function='JSON_REMOVE', **extra_context)
-
-    def as_postgresql(self, compiler, connection, **extra_context):
-        paths = [arg for arg in self.source_expressions[1:]]
-        path_array = "ARRAY[" + ", ".join(f"'{p}'" for p in paths) + "]::text[]"
-        template = f"jsonb_strip_nulls(%(expressions)s #- {path_array})"
-        return self.as_sql(compiler, connection, template=template, **extra_context)
-
-    def as_mysql(self, compiler, connection, **extra_context):
-        return self.as_sql(compiler, connection, function='JSON_REMOVE', **extra_context)
-
-    def as_oracle(self, compiler, connection, **extra_context):
-        return self.as_sql(compiler, connection, function='JSON_TRANSFORM', **extra_context)
-
+            raise NotImplementedError(f"JSONRemove is not supported for {vendor}.")
 
 class Least(Func):
     """
